@@ -13,4 +13,4 @@ Clone the repository and run:
 
 The compiled plugin JAR will be generated in the `build/libs` directory.
 
-View the demo on [YouTube](https://youtu.be/j0EKwbotH6o)
+View the demo on <a href="https://youtu.be/j0EKwbotH6o" target="_blank" rel="noopener noreferrer">YouTube</a>
