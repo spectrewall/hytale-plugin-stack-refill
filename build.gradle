@@ -1,0 +1,107 @@
+plugins {
+  id 'java'
+  id 'org.jetbrains.gradle.plugin.idea-ext' version '1.3'
+  id 'com.gradleup.shadow' version '9.3.1'
+  id 'com.diffplug.spotless' version '6.22.0'
+}
+
+import org.gradle.internal.os.OperatingSystem
+
+ext {
+  if (project.hasProperty('hytale_home')) {
+    hytaleHome = project.findProperty('hytale_home')
+  } else if (System.getenv('HYTALE_HOME')) {
+    hytaleHome = System.getenv('HYTALE_HOME')
+  } else {
+    def os = OperatingSystem.current()
+    if (os.isWindows()) {
+      hytaleHome = "${System.getProperty("user.home")}/AppData/Roaming/Hytale"
+    } else if (os.isMacOsX()) {
+      hytaleHome = "${System.getProperty("user.home")}/Library/Application Support/Hytale"
+    } else if (os.isLinux()) {
+      hytaleHome = "${System.getProperty("user.home")}/.var/app/com.hypixel.HytaleLauncher/data/Hytale"
+      if (!file(hytaleHome).exists()) {
+        hytaleHome = "${System.getProperty("user.home")}/.local/share/Hytale"
+      }
+    }
+  }
+}
+
+def hytaleHomePath = ext.has('hytaleHome') ? hytaleHome : null
+def hasHytaleHome = (hytaleHomePath != null) && file(hytaleHomePath).exists()
+
+java {
+  toolchain.languageVersion = JavaLanguageVersion.of(java_version)
+  withSourcesJar()
+  withJavadocJar()
+}
+
+javadoc {
+  options.addStringOption('Xdoclint:-missing', '-quiet')
+}
+
+repositories {
+  mavenCentral()
+  maven {
+    name = "hytale-release"
+    url = uri("https://maven.hytale.com/release")
+  }
+  maven {
+    name = "hytale-pre-release"
+    url = uri("https://maven.hytale.com/pre-release")
+  }
+}
+
+dependencies {
+  compileOnly("com.hypixel.hytale:Server:$hytale_build")
+
+  if (hasHytaleHome) {
+    runtimeOnly(files("$hytaleHome/install/$patchline/package/game/latest/Server/HytaleServer.jar"))
+  }
+}
+
+tasks.named('shadowJar') {
+  archiveClassifier.set('all') // mantém -all.jar
+  mergeServiceFiles()
+}
+
+if (hasHytaleHome) {
+
+  def serverRunDir = file("$projectDir/run")
+  if (!serverRunDir.exists()) {
+    serverRunDir.mkdirs()
+  }
+
+  def serverJar = file("$hytaleHome/install/$patchline/package/game/latest/Server/HytaleServer.jar")
+  def assetsZip = file("$hytaleHome/install/$patchline/package/game/latest/Assets.zip")
+  def shadowJarTask = tasks.named('shadowJar')
+
+  tasks.register('runServerJar', JavaExec) {
+    dependsOn shadowJarTask
+    mainClass = 'com.hypixel.hytale.Main'
+    classpath = files(serverJar)
+    workingDir = serverRunDir.absolutePath
+
+    doFirst {
+      setArgs([
+          '--allow-op',
+          '--disable-sentry',
+          "--assets=${assetsZip}",
+          "--mods=${shadowJarTask.get().archiveFile.get().asFile.absolutePath}"
+      ])
+    }
+  }
+
+  tasks.register('runServer') {
+    dependsOn 'runServerJar'
+  }
+}
+
+spotless {
+  java {
+    eclipse()
+    removeUnusedImports()
+    trimTrailingWhitespace()
+    endWithNewline()
+  }
+}
