@@ -6,9 +6,8 @@ import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.component.query.Query;
 import com.hypixel.hytale.component.system.EntityEventSystem;
-import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.event.events.ecs.PlaceBlockEvent;
-import com.hypixel.hytale.server.core.inventory.Inventory;
+import com.hypixel.hytale.server.core.inventory.InventoryComponent;
 import com.hypixel.hytale.server.core.inventory.ItemStack;
 import com.hypixel.hytale.server.core.inventory.container.ItemContainer;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
@@ -18,6 +17,8 @@ import com.spectrewall.stackrefill.util.records.SearchResult;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.logging.Level;
 
 import static com.hypixel.hytale.logger.HytaleLogger.getLogger;
@@ -34,17 +35,24 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 			@Nonnull final Store<EntityStore> store, @Nonnull final CommandBuffer<EntityStore> commandBuffer,
 			@Nonnull final PlaceBlockEvent event) {
 		Ref<EntityStore> ref = archetypeChunk.getReferenceTo(index);
-		Player player = store.getComponent(ref, Player.getComponentType());
 		var item = event.getItemInHand();
 
-		if (item == null || player == null || item.getQuantity() > 1) {
+		if (item == null || item.getQuantity() > 1) {
 			return;
 		}
 
 		String itemId = item.getItem().getId();
-		Inventory inventory = player.getInventory();
 
-		ItemStack mainHandItem = inventory.getActiveHotbarItem();
+		InventoryComponent.Hotbar hotbar = store.getComponent(ref, InventoryComponent.Hotbar.getComponentType());
+		InventoryComponent.Utility utility = store.getComponent(ref, InventoryComponent.Utility.getComponentType());
+		InventoryComponent.Storage storage = store.getComponent(ref, InventoryComponent.Storage.getComponentType());
+		InventoryComponent.Backpack backpack = store.getComponent(ref, InventoryComponent.Backpack.getComponentType());
+
+		if (hotbar == null) {
+			return;
+		}
+
+		ItemStack mainHandItem = hotbar.getActiveItem();
 		boolean mainHandMatches = mainHandItem != null && mainHandItem.getItem().getId().equals(itemId);
 
 		// If main hand matches but has quantity > 1, the placed block must have come
@@ -56,22 +64,33 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 		ItemContainer targetContainer;
 
 		if (isMainHand) {
-			activeSlot = inventory.getActiveHotbarSlot();
-			targetContainer = inventory.getHotbar();
+			activeSlot = hotbar.getActiveSlot();
+			targetContainer = hotbar.getInventory();
+		} else if (utility != null) {
+			activeSlot = utility.getActiveSlot();
+			targetContainer = utility.getInventory();
 		} else {
-			activeSlot = inventory.getActiveUtilitySlot();
-			targetContainer = inventory.getUtility();
+			return;
 		}
 
 		getLogger().at(Level.FINE).log("StackRefill: Searching inventory for more blocks...");
 
-		SearchQuery[] queries = isMainHand
-				? new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
-						new SearchQuery(inventory.getStorage(), itemId),
-						new SearchQuery(inventory.getBackpack(), itemId),}
-				: new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
-						new SearchQuery(inventory.getHotbar(), itemId), new SearchQuery(inventory.getStorage(), itemId),
-						new SearchQuery(inventory.getBackpack(), itemId),};
+		List<SearchQuery> queryList = new ArrayList<>();
+		queryList.add(new SearchQuery(targetContainer, itemId, activeSlot));
+
+		if (!isMainHand) {
+			queryList.add(new SearchQuery(hotbar.getInventory(), itemId));
+		}
+
+		if (storage != null) {
+			queryList.add(new SearchQuery(storage.getInventory(), itemId));
+		}
+
+		if (backpack != null) {
+			queryList.add(new SearchQuery(backpack.getInventory(), itemId));
+		}
+
+		SearchQuery[] queries = queryList.toArray(SearchQuery[]::new);
 
 		SearchResult result = findItemSlot(queries);
 
