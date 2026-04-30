@@ -43,13 +43,30 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 
 		String itemId = item.getItem().getId();
 		Inventory inventory = player.getInventory();
-		byte activeSlot = inventory.getActiveHotbarSlot();
-		ItemContainer hotbar = inventory.getHotbar();
+
+		ItemStack utilityItem = inventory.getUtilityItem();
+		boolean isOffHand = utilityItem != null && utilityItem.getItem().getId().equals(itemId);
+
+		byte activeSlot;
+		ItemContainer targetContainer;
+
+		if (isOffHand) {
+			activeSlot = inventory.getActiveUtilitySlot();
+			targetContainer = inventory.getUtility();
+		} else {
+			activeSlot = inventory.getActiveHotbarSlot();
+			targetContainer = inventory.getHotbar();
+		}
 
 		getLogger().at(Level.FINE).log("StackRefill: Searching inventory for more blocks...");
 
-		SearchQuery[] queries = {new SearchQuery(hotbar, itemId, activeSlot),
-				new SearchQuery(inventory.getStorage(), itemId), new SearchQuery(inventory.getBackpack(), itemId),};
+		SearchQuery[] queries = isOffHand
+				? new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
+						new SearchQuery(inventory.getHotbar(), itemId), new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getBackpack(), itemId),}
+				: new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
+						new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getBackpack(), itemId),};
 
 		SearchResult result = findItemSlot(queries);
 
@@ -69,7 +86,7 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 		// The +1 is necessary because the block is subtracted only after this code runs
 		ItemStack newStack = stack.withQuantity(stack.getQuantity() + 1);
 
-		hotbar.setItemStackForSlot(activeSlot, newStack);
+		targetContainer.setItemStackForSlot(activeSlot, newStack);
 		result.container().removeItemStackFromSlot(result.slot());
 		getLogger().at(Level.FINE).log("StackRefill: Stack Refilled!");
 	}
