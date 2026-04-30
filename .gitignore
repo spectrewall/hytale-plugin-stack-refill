@@ -42,6 +42,9 @@ bin/
 !.vscode/java-formatter.xml
 !.vscode/settings.json
 
+# Claude Code
+.claude/settings.local.json
+
 # Mac OS
 .DS_Store
 

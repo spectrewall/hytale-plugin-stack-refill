@@ -24,7 +24,7 @@ Stack Refill is a Hytale server plugin that automatically refills the player's h
 The plugin follows Hytale's ECS event system pattern:
 
 - **`StackRefill`** — Main plugin entry point (`JavaPlugin` subclass). Registers event systems in `setup()`. Singleton via `getInstance()`.
-- **`PlaceBlockEventSystem`** — Core logic. Listens for `PlaceBlockEvent`, triggers when a player places their last block (quantity == 1). Searches containers in order: hotbar → inventory storage → backpack.
+- **`PlaceBlockEventSystem`** — Core logic. Listens for `PlaceBlockEvent`, triggers when a player places their last block (quantity == 1). Detects which hand (main or off-hand) placed the block using item ID and quantity comparison, then searches for replacements in the appropriate containers: main hand searches hotbar → storage → backpack; off-hand searches utility → hotbar → storage → backpack. Refills into the correct hand's slot.
 - **`InventorySearch`** — Static utility that iterates container slots to find a matching item ID. Accepts single or multiple `SearchQuery` objects and returns a `SearchResult`.
 - **`SearchQuery`** / **`SearchResult`** — Java records with validation. `SearchQuery` holds container + item ID + optional slot to ignore. `SearchResult` uses factory methods `found()` / `notFound()` with invariant checks.
 

@@ -44,28 +44,33 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 		String itemId = item.getItem().getId();
 		Inventory inventory = player.getInventory();
 
-		ItemStack utilityItem = inventory.getUtilityItem();
-		boolean isOffHand = utilityItem != null && utilityItem.getItem().getId().equals(itemId);
+		ItemStack mainHandItem = inventory.getActiveHotbarItem();
+		boolean mainHandMatches = mainHandItem != null && mainHandItem.getItem().getId().equals(itemId);
+
+		// If main hand matches but has quantity > 1, the placed block must have come
+		// from the off-hand,
+		// since this event only fires when the placed item has quantity == 1.
+		boolean isMainHand = mainHandMatches && mainHandItem.getQuantity() == 1;
 
 		byte activeSlot;
 		ItemContainer targetContainer;
 
-		if (isOffHand) {
-			activeSlot = inventory.getActiveUtilitySlot();
-			targetContainer = inventory.getUtility();
-		} else {
+		if (isMainHand) {
 			activeSlot = inventory.getActiveHotbarSlot();
 			targetContainer = inventory.getHotbar();
+		} else {
+			activeSlot = inventory.getActiveUtilitySlot();
+			targetContainer = inventory.getUtility();
 		}
 
 		getLogger().at(Level.FINE).log("StackRefill: Searching inventory for more blocks...");
 
-		SearchQuery[] queries = isOffHand
+		SearchQuery[] queries = isMainHand
 				? new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
-						new SearchQuery(inventory.getHotbar(), itemId), new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getStorage(), itemId),
 						new SearchQuery(inventory.getBackpack(), itemId),}
 				: new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
-						new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getHotbar(), itemId), new SearchQuery(inventory.getStorage(), itemId),
 						new SearchQuery(inventory.getBackpack(), itemId),};
 
 		SearchResult result = findItemSlot(queries);
