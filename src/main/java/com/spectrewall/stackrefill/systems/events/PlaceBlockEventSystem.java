@@ -43,13 +43,35 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 
 		String itemId = item.getItem().getId();
 		Inventory inventory = player.getInventory();
-		byte activeSlot = inventory.getActiveHotbarSlot();
-		ItemContainer hotbar = inventory.getHotbar();
+
+		ItemStack mainHandItem = inventory.getActiveHotbarItem();
+		boolean mainHandMatches = mainHandItem != null && mainHandItem.getItem().getId().equals(itemId);
+
+		// If main hand matches but has quantity > 1, the placed block must have come
+		// from the off-hand,
+		// since this event only fires when the placed item has quantity == 1.
+		boolean isMainHand = mainHandMatches && mainHandItem.getQuantity() == 1;
+
+		byte activeSlot;
+		ItemContainer targetContainer;
+
+		if (isMainHand) {
+			activeSlot = inventory.getActiveHotbarSlot();
+			targetContainer = inventory.getHotbar();
+		} else {
+			activeSlot = inventory.getActiveUtilitySlot();
+			targetContainer = inventory.getUtility();
+		}
 
 		getLogger().at(Level.FINE).log("StackRefill: Searching inventory for more blocks...");
 
-		SearchQuery[] queries = {new SearchQuery(hotbar, itemId, activeSlot),
-				new SearchQuery(inventory.getStorage(), itemId), new SearchQuery(inventory.getBackpack(), itemId),};
+		SearchQuery[] queries = isMainHand
+				? new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
+						new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getBackpack(), itemId),}
+				: new SearchQuery[]{new SearchQuery(targetContainer, itemId, activeSlot),
+						new SearchQuery(inventory.getHotbar(), itemId), new SearchQuery(inventory.getStorage(), itemId),
+						new SearchQuery(inventory.getBackpack(), itemId),};
 
 		SearchResult result = findItemSlot(queries);
 
@@ -69,7 +91,7 @@ public class PlaceBlockEventSystem extends EntityEventSystem<EntityStore, PlaceB
 		// The +1 is necessary because the block is subtracted only after this code runs
 		ItemStack newStack = stack.withQuantity(stack.getQuantity() + 1);
 
-		hotbar.setItemStackForSlot(activeSlot, newStack);
+		targetContainer.setItemStackForSlot(activeSlot, newStack);
 		result.container().removeItemStackFromSlot(result.slot());
 		getLogger().at(Level.FINE).log("StackRefill: Stack Refilled!");
 	}
