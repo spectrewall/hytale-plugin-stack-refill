@@ -9,7 +9,7 @@
         }
     ],
     "Website": "https://github.com/spectrewall",
-    "ServerVersion": "2026.03.26-89796e57b",
+    "ServerVersion": "0.5.3",
     "Dependencies": {},
     "OptionalDependencies": {},
     "DisabledByDefault": false,
