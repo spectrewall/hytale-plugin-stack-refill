@@ -1,0 +1,302 @@
+name: Refresh Hytale References
+
+# Autonomous reference-tracking pipeline.
+#
+# Triggered MANUALLY (workflow_dispatch) or VIA WEBHOOK (repository_dispatch),
+# it queries the Hytale maven repositories for the newest published Server
+# reference on the requested patchline(s), bumps the pinned version, and tries
+# to compile.
+#   - Compiles cleanly  -> opens a version-bump PR (no Claude, no API cost).
+#   - Fails to compile  -> pushes the bump branch, opens an issue labelled
+#                          `hytale-build-failure` (for humans), and fires a
+#                          `repository_dispatch` that starts the companion
+#                          auto-fix workflow (auto-fix-hytale-build.yml).
+#
+# Why dispatch instead of relying on the issue event: GitHub deliberately
+# refuses to start a workflow from an `issues` event created with the default
+# GITHUB_TOKEN (anti-loop protection). `repository_dispatch` is one of the few
+# events that DOES fire from GITHUB_TOKEN, so it is the reliable handoff.
+#
+# Channel -> base branch mapping (chosen by the maintainer):
+#   release      -> main
+#   pre-release  -> develop   (created from main on first run if missing)
+
+on:
+  workflow_dispatch:
+    inputs:
+      patchline:
+        description: "Channel(s) to check"
+        type: choice
+        default: both
+        options:
+          - both
+          - release
+          - pre-release
+  repository_dispatch:
+    # Fire externally with:
+    #   curl -X POST -H "Accept: application/vnd.github+json" \
+    #     -H "Authorization: Bearer <PAT with repo scope>" \
+    #     https://api.github.com/repos/<owner>/<repo>/dispatches \
+    #     -d '{"event_type":"check-hytale-references","client_payload":{"patchline":"both"}}'
+    types: [check-hytale-references]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-hytale-references
+  cancel-in-progress: false
+
+jobs:
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      patchlines: ${{ steps.set.outputs.patchlines }}
+    steps:
+      - id: set
+        env:
+          REQUESTED: ${{ github.event.inputs.patchline || github.event.client_payload.patchline || 'both' }}
+        run: |
+          case "$REQUESTED" in
+            release)     echo 'patchlines=["release"]' >> "$GITHUB_OUTPUT" ;;
+            pre-release) echo 'patchlines=["pre-release"]' >> "$GITHUB_OUTPUT" ;;
+            both|"")     echo 'patchlines=["release","pre-release"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Unknown patchline '$REQUESTED'"; exit 1 ;;
+          esac
+
+  refresh:
+    needs: resolve-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        patchline: ${{ fromJSON(needs.resolve-matrix.outputs.patchlines) }}
+    steps:
+      - name: Map patchline -> base branch
+        id: map
+        env:
+          PATCHLINE: ${{ matrix.patchline }}
+        run: |
+          if [ "$PATCHLINE" = "release" ]; then
+            echo "base=main" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=develop" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare base branch
+        id: base
+        env:
+          BASE: ${{ steps.map.outputs.base }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Make sure every remote branch is locally visible.
+          git fetch origin --prune '+refs/heads/*:refs/remotes/origin/*'
+          if git show-ref --verify --quiet "refs/remotes/origin/$BASE"; then
+            git checkout -B "$BASE" "origin/$BASE"
+          else
+            echo "::notice::Base branch '$BASE' not found; creating it from origin/main."
+            git checkout -B "$BASE" "origin/main"
+            git push origin "$BASE"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve latest version from Hytale maven
+        id: latest
+        env:
+          PATCHLINE: ${{ matrix.patchline }}
+        run: |
+          set -euo pipefail
+          META="https://maven.hytale.com/${PATCHLINE}/com/hypixel/hytale/Server/maven-metadata.xml"
+          echo "Fetching $META"
+          XML="$(curl -fsSL --retry 3 --retry-delay 2 "$META")"
+          LATEST="$(printf '%s' "$XML" | sed -n 's:.*<release>\(.*\)</release>.*:\1:p' | head -1 | tr -d '[:space:]')"
+          if [ -z "$LATEST" ]; then
+            LATEST="$(printf '%s' "$XML" | sed -n 's:.*<latest>\(.*\)</latest>.*:\1:p' | head -1 | tr -d '[:space:]')"
+          fi
+          if [ -z "$LATEST" ]; then
+            echo "::error::Could not parse the latest version from $META"; exit 1
+          fi
+          # Strict allowlist: the version is interpolated into branch names, sed
+          # replacements and PR/issue text. Reject anything with shell/sed/markup
+          # metacharacters (defends against a hostile or compromised maven entry).
+          if ! printf '%s' "$LATEST" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::Rejecting non-conforming Hytale version '$LATEST'"; exit 1
+          fi
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest on '$PATCHLINE' = $LATEST"
+
+      - name: Read current pinned version
+        id: current
+        run: |
+          set -euo pipefail
+          CUR="$(grep -E '^hytale_build=' gradle.properties | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+          echo "current=$CUR" >> "$GITHUB_OUTPUT"
+          echo "Currently pinned = $CUR"
+
+      - name: Decide whether a bump is needed
+        id: decide
+        env:
+          LATEST: ${{ steps.latest.outputs.latest }}
+          CURRENT: ${{ steps.current.outputs.current }}
+          PATCHLINE: ${{ matrix.patchline }}
+        run: |
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::'$PATCHLINE' already up to date ($CURRENT). Nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::'$PATCHLINE' bump: $CURRENT -> $LATEST"
+          fi
+
+      - name: Apply version bump
+        if: steps.decide.outputs.changed == 'true'
+        id: bump
+        env:
+          NEW: ${{ steps.latest.outputs.latest }}
+          PATCHLINE: ${{ matrix.patchline }}
+        run: |
+          set -euo pipefail
+          BRANCH="auto/hytale-${PATCHLINE}-${NEW}"
+          # Idempotency: if the bump branch already exists upstream, a previous run
+          # already handled this version (PR open or fix in flight). Skip silently.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Branch $BRANCH already exists upstream; skipping duplicate bump."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git checkout -b "$BRANCH"
+          # NEW is allowlisted to [A-Za-z0-9._-] above, so it is safe as a sed
+          # replacement (no '/', '&' or newline) and as a branch/commit token.
+          sed -i -E "s/^hytale_build=.*/hytale_build=${NEW}/" gradle.properties
+          sed -i -E "s/^patchline=.*/patchline=${PATCHLINE}/" gradle.properties
+          # manifest.json ServerVersion mirrors the maven semver (maintainer decision).
+          sed -i -E "s/(\"ServerVersion\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${NEW}\2/" \
+            src/main/resources/manifest.json
+          git add gradle.properties src/main/resources/manifest.json
+          git commit -m "Chore: Bump Hytale ${PATCHLINE} reference to ${NEW}"
+          git push origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 25
+        if: steps.decide.outputs.changed == 'true' && steps.bump.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "25"
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Compile against the new reference
+        if: steps.decide.outputs.changed == 'true' && steps.bump.outputs.skip == 'false'
+        id: build
+        run: |
+          # GitHub runs steps with `set -eo pipefail`; relax errexit so we can
+          # capture gradle's exit code and branch on it instead of aborting.
+          set +e
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain build 2>&1 | tee build.log
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open version-bump PR (build passed)
+        if: steps.decide.outputs.changed == 'true' && steps.bump.outputs.skip == 'false' && steps.build.outputs.exit == '0'
+        env:
+          # Use a PAT (if configured) so this PR triggers the Build Plugin CI;
+          # PRs opened with the default GITHUB_TOKEN do not start other workflows.
+          GH_TOKEN: ${{ secrets.CI_PAT || secrets.GITHUB_TOKEN }}
+          PATCHLINE: ${{ matrix.patchline }}
+          FROM: ${{ steps.current.outputs.current }}
+          TO: ${{ steps.latest.outputs.latest }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "Chore: Bump Hytale ${PATCHLINE} reference to ${TO}" \
+            --body "Automated bump of the Hytale \`${PATCHLINE}\` reference from \`${FROM}\` to \`${TO}\`.
+
+          The project **compiled cleanly** against the new reference (\`./gradlew build\`). No source changes were required."
+
+      - name: Report failure and trigger auto-fix (build failed)
+        if: steps.decide.outputs.changed == 'true' && steps.bump.outputs.skip == 'false' && steps.build.outputs.exit != '0'
+        env:
+          # Created with the default token: repository_dispatch (sent below) fires
+          # from GITHUB_TOKEN, so no PAT is required for the auto-fix handoff.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATCHLINE: ${{ matrix.patchline }}
+          FROM: ${{ steps.current.outputs.current }}
+          TO: ${{ steps.latest.outputs.latest }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          BASE: ${{ steps.base.outputs.base }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          TITLE="Hytale ${PATCHLINE} bump to ${TO} broke the build"
+
+          # No-spam: skip if an open failure issue with this EXACT title already
+          # exists (exact jq match, not GitHub's fuzzy token search).
+          EXISTING="$(gh issue list --state open --label hytale-build-failure --json title \
+            | jq --arg t "$TITLE" '[.[] | select(.title == $t)] | length')"
+          if [ "${EXISTING:-0}" != "0" ]; then
+            echo "::notice::An open failure issue titled \"$TITLE\" already exists; skipping."
+            exit 0
+          fi
+
+          gh label create hytale-build-failure \
+            --color B60205 \
+            --description "Autonomous Hytale reference bump broke the build" \
+            --force
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "The autonomous reference bump **failed to compile**. The companion"
+            echo "auto-fix workflow has been dispatched to adapt the plugin to the new"
+            echo "Hytale API. This issue is the human-readable record of the failure."
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Patchline | \`${PATCHLINE}\` |"
+            echo "| From | \`${FROM}\` |"
+            echo "| To | \`${TO}\` |"
+            echo "| Bump branch | \`${BRANCH}\` |"
+            echo "| Target base | \`${BASE}\` |"
+            echo
+            echo "### Gradle build log (tail)"
+            echo '````text'
+            tail -n 250 build.log
+            echo '````'
+          } > "$BODY_FILE"
+
+          ISSUE_URL="$(gh issue create \
+            --title "$TITLE" \
+            --label hytale-build-failure \
+            --body-file "$BODY_FILE")"
+          ISSUE_NUM="${ISSUE_URL##*/}"
+          echo "Opened issue #${ISSUE_NUM}"
+
+          # Hand off to the auto-fix workflow. repository_dispatch fires even when
+          # sent with GITHUB_TOKEN. The client_payload is server-controlled (built
+          # from this workflow's validated outputs), not from the mutable issue body.
+          jq -n \
+            --arg branch "$BRANCH" \
+            --arg base "$BASE" \
+            --arg patchline "$PATCHLINE" \
+            --arg from "$FROM" \
+            --arg to "$TO" \
+            --arg issue "$ISSUE_NUM" \
+            '{event_type:"hytale-build-failure", client_payload:{branch:$branch, base:$base, patchline:$patchline, from:$from, to:$to, issue:$issue}}' \
+            | gh api --method POST "repos/${REPO}/dispatches" --input -
+          echo "Dispatched hytale-build-failure for $BRANCH"

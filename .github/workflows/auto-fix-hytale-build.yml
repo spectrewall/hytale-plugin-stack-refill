@@ -1,0 +1,220 @@
+name: Auto-Fix Hytale Build
+
+# Companion to refresh-hytale-references.yml.
+#
+# When a Hytale reference bump fails to compile, the refresh workflow fires a
+# `repository_dispatch` (type `hytale-build-failure`) carrying the bump details.
+# This workflow checks out the bump branch and runs Claude Code to adapt the
+# plugin's source to the new API, then opens a pull request that closes the
+# tracking issue.
+#
+# Trust model:
+#   - The ONLY automatic trigger is `repository_dispatch`, which requires repo
+#     write access to send, so an unprivileged actor cannot start a Claude run.
+#   - The metadata comes from `client_payload` (built by the trusted refresh
+#     workflow), NOT from a mutable issue body, and is still re-validated below.
+#   - `workflow_dispatch` is a manual escape hatch (requires write access) for
+#     re-running or debugging a fix.
+
+on:
+  repository_dispatch:
+    types: [hytale-build-failure]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Bump branch (auto/hytale-<patchline>-<version>)"
+        required: true
+      base:
+        description: "Base branch to target"
+        required: true
+        type: choice
+        options: [main, develop]
+      patchline:
+        description: "Patchline"
+        required: true
+        type: choice
+        options: [release, pre-release]
+      to:
+        description: "New Hytale version"
+        required: true
+      from:
+        description: "Previous Hytale version"
+        required: false
+        default: "unknown"
+      issue:
+        description: "Tracking issue number to close (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: auto-fix-${{ github.event.client_payload.branch || github.event.inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve and validate metadata
+        id: meta
+        env:
+          BRANCH: ${{ github.event.client_payload.branch || github.event.inputs.branch }}
+          BASE: ${{ github.event.client_payload.base || github.event.inputs.base }}
+          PATCHLINE: ${{ github.event.client_payload.patchline || github.event.inputs.patchline }}
+          FROM: ${{ github.event.client_payload.from || github.event.inputs.from }}
+          TO: ${{ github.event.client_payload.to || github.event.inputs.to }}
+          ISSUE: ${{ github.event.client_payload.issue || github.event.inputs.issue }}
+        run: |
+          set -euo pipefail
+          # Strict allowlists — defence in depth even though the payload is trusted.
+          # Full-string anchored match (NOT a prefix glob): the version suffix must
+          # be [A-Za-z0-9._-] only, so no shell metacharacters can ride along into
+          # the checkout ref or the `git checkout <branch>` Claude is told to run.
+          printf '%s' "$BRANCH" | grep -Eq '^auto/hytale-(release|pre-release)-[A-Za-z0-9._-]+$' \
+            || { echo "::error::Invalid branch '$BRANCH'"; exit 1; }
+          case "$BASE" in
+            main|develop) : ;;
+            *) echo "::error::Invalid base '$BASE'"; exit 1 ;;
+          esac
+          case "$PATCHLINE" in
+            release|pre-release) : ;;
+            *) echo "::error::Invalid patchline '$PATCHLINE'"; exit 1 ;;
+          esac
+          for v in "$FROM" "$TO"; do
+            printf '%s' "$v" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo "::error::Invalid version '$v'"; exit 1; }
+          done
+          # Issue number: keep only if it is purely digits, else blank it.
+          case "$ISSUE" in
+            ''|*[!0-9]*) ISSUE="" ;;
+          esac
+          {
+            echo "branch=$BRANCH"
+            echo "base=$BASE"
+            echo "patchline=$PATCHLINE"
+            echo "from=$FROM"
+            echo "to=$TO"
+            echo "issue=$ISSUE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the bump branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.CI_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Skip if a PR already exists for this branch
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        run: |
+          set -euo pipefail
+          OPEN="$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')"
+          if [ "${OPEN:-0}" != "0" ]; then
+            echo "::notice::A PR already exists for $BRANCH; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 25
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "25"
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Decompile the new Hytale API into local refs (best effort)
+        if: steps.guard.outputs.skip == 'false'
+        continue-on-error: true
+        env:
+          PATCHLINE: ${{ steps.meta.outputs.patchline }}
+          TO: ${{ steps.meta.outputs.to }}
+        run: |
+          # The Hytale Server artifact ships no -sources.jar, so we give Claude the
+          # decompiled API to read/grep. This is the CI-feasible analogue of the
+          # community "patcher" refs (which need a HytaleServer.jar from a running
+          # game install and so cannot run headless). Never blocks the fix.
+          set -uo pipefail
+          REFS="$GITHUB_WORKSPACE/.hytale-refs"
+          WORK="$RUNNER_TEMP/vineflower"
+          mkdir -p "$REFS" "$WORK/out"
+          JAR_URL="https://maven.hytale.com/${PATCHLINE}/com/hypixel/hytale/Server/${TO}/Server-${TO}.jar"
+          if ! curl -fsSL -o "$WORK/Server.jar" "$JAR_URL"; then
+            echo "::warning::Could not download $JAR_URL; Claude will fix from compiler errors only."; exit 0
+          fi
+          if ! curl -fsSL -o "$WORK/vineflower.jar" \
+            "https://github.com/Vineflower/vineflower/releases/download/1.12.0/vineflower-1.12.0.jar"; then
+            echo "::warning::Could not download Vineflower; skipping decompile."; exit 0
+          fi
+          # Vineflower writes a jar of .java sources into the output directory.
+          if ! java -jar "$WORK/vineflower.jar" "$WORK/Server.jar" "$WORK/out"; then
+            echo "::warning::Decompile failed; skipping refs."; exit 0
+          fi
+          if ls "$WORK"/out/*.jar >/dev/null 2>&1; then
+            unzip -oq "$WORK"/out/*.jar -d "$REFS" || true
+          else
+            cp -r "$WORK"/out/. "$REFS"/ 2>/dev/null || true
+          fi
+          echo "Decompiled $(find "$REFS" -name '*.java' 2>/dev/null | wc -l) .java files into .hytale-refs/"
+
+      - name: Claude adapts the plugin to the new Hytale API
+        if: steps.guard.outputs.skip == 'false'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # A PAT (if configured) makes Claude's commits/PR trigger the Build
+          # Plugin CI. Falls back to the default token otherwise.
+          github_token: ${{ secrets.CI_PAT || secrets.GITHUB_TOKEN }}
+          # The run is triggered by github-actions[bot] (the dispatch sender), and
+          # the action blocks bot actors unless they are explicitly allowed.
+          allowed_bots: "github-actions"
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 50
+            --allowedTools "Bash,Read,Edit,Write,Glob,Grep"
+          prompt: |
+            You are maintaining the "Stack Refill" Hytale server plugin (Java 25,
+            Gradle). A pipeline bumped the pinned Hytale Server API reference and the
+            project no longer compiles.
+
+            Context (already applied on this branch — do NOT re-derive):
+            - Patchline: ${{ steps.meta.outputs.patchline }}
+            - Reference bumped: ${{ steps.meta.outputs.from }} -> ${{ steps.meta.outputs.to }}
+            - The bump is committed on branch `${{ steps.meta.outputs.branch }}`
+              (gradle.properties: hytale_build + patchline; manifest.json: ServerVersion).
+            - Tracking issue number (may be empty): "${{ steps.meta.outputs.issue }}".
+              If non-empty, read it first with `gh issue view ${{ steps.meta.outputs.issue }}`
+              to see the full Gradle error log.
+            - Decompiled sources of the NEW Hytale API are in `.hytale-refs/` at the repo
+              root (best-effort Vineflower output; may contain minor decompiler artifacts,
+              and may be absent if decompilation failed). Grep/read them to discover the
+              correct new / renamed / moved / re-signatured API symbols. `.hytale-refs/`
+              is gitignored — never commit it.
+
+            Do exactly this:
+            1. Ensure you are on the correct branch:
+               `git fetch origin ${{ steps.meta.outputs.branch }} && git checkout ${{ steps.meta.outputs.branch }}`
+            2. Reproduce the failure: `chmod +x gradlew && ./gradlew --no-daemon --console=plain build`
+            3. Fix ONLY the plugin source under `src/` so it compiles against the new
+               Hytale API. Use `.hytale-refs/` (decompiled API sources) together with the
+               compiler errors to find the correct new symbols. Adapt to renamed / moved /
+               removed / re-signatured API symbols. Preserve the behaviour described in
+               CLAUDE.md and README.md. Do NOT revert the version bump, do NOT modify any
+               file under `.github/`, and do NOT commit `.hytale-refs/`.
+            4. Make the build green: re-run `./gradlew --no-daemon build` and
+               `./gradlew spotlessApply` until both pass with no errors.
+            5. Commit to `${{ steps.meta.outputs.branch }}`, push, and open exactly one
+               pull request:
+               `gh pr create --base ${{ steps.meta.outputs.base }} --head ${{ steps.meta.outputs.branch }} --title "Fix: Adapt Stack Refill to Hytale ${{ steps.meta.outputs.patchline }} ${{ steps.meta.outputs.to }}" --body "<summary of the API changes you adapted to>"`
+               If the tracking issue number above is non-empty, append a line
+               "Closes #${{ steps.meta.outputs.issue }}" to the PR body.
+            6. If — and only if — you cannot make it compile, post a comment on the
+               tracking issue (if provided) explaining precisely what is blocking, and
+               do NOT open a pull request.
