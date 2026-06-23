@@ -2,6 +2,7 @@ package com.spectrewall.stackrefill;
 
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
+import com.spectrewall.stackrefill.systems.events.BucketRefillEventSystem;
 import com.spectrewall.stackrefill.systems.events.PlaceBlockEventSystem;
 
 import javax.annotation.Nonnull;
@@ -42,5 +43,6 @@ public class StackRefill extends JavaPlugin {
 
 		super.setup();
 		this.getEntityStoreRegistry().registerSystem(new PlaceBlockEventSystem());
+		this.getEntityStoreRegistry().registerSystem(new BucketRefillEventSystem());
 	}
 }
