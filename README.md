@@ -14,3 +14,10 @@ Clone the repository and run:
 The compiled plugin JAR will be generated in the `build/libs` directory.
 
 View the demo on <a href="https://youtu.be/j0EKwbotH6o" target="_blank" rel="noopener noreferrer">YouTube</a>
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). You are free to use,
+modify and distribute the code, **as long as the original copyright notice and
+credit to SpectreWall are kept** in copies or substantial portions of the
+software.
