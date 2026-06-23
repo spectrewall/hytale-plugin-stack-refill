@@ -72,6 +72,10 @@ if (hasHytaleHome) {
     serverRunDir.mkdirs()
   }
 
+  // The server scans a "mods" directory (relative to its working dir) for mod
+  // jars by default, so we drop the built jar there instead of passing --mods.
+  def modsDir = file("$serverRunDir/mods")
+
   def serverJar = file("$hytaleHome/install/$patchline/package/game/latest/Server/HytaleServer.jar")
   def assetsZip = file("$hytaleHome/install/$patchline/package/game/latest/Assets.zip")
   def shadowJarTask = tasks.named('shadowJar')
@@ -82,12 +86,23 @@ if (hasHytaleHome) {
     classpath = files(serverJar)
     workingDir = serverRunDir.absolutePath
 
+    // Forward the terminal's stdin to the server so its console (e.g.
+    // /auth login) accepts typed commands.
+    standardInput = System.in
+
     doFirst {
+      // Refresh the mods dir so only the freshly built jar is loaded.
+      delete modsDir
+      mkdir modsDir
+      copy {
+        from shadowJarTask.get().archiveFile
+        into modsDir
+      }
+
       setArgs([
           '--allow-op',
           '--disable-sentry',
-          "--assets=${assetsZip}",
-          "--mods=${shadowJarTask.get().archiveFile.get().asFile.absolutePath}"
+          "--assets=${assetsZip}"
       ])
     }
   }
