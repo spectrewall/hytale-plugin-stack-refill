@@ -1,7 +1,7 @@
 {
     "Group": "SpectreWall",
     "Name": "Stack Refill",
-    "Version": "1.1.0",
+    "Version": "1.2.0",
     "Description": "A plugin to refill your stacks!",
     "Authors": [
         {
@@ -9,7 +9,7 @@
         }
     ],
     "Website": "https://github.com/spectrewall",
-    "ServerVersion": "^0.5",
+    "ServerVersion": "^0.6",
     "Dependencies": {},
     "OptionalDependencies": {},
     "DisabledByDefault": false,
